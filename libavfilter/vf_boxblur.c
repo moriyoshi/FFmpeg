@@ -27,13 +27,44 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/common.h"
+#include "libavutil/eval.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
+#include "libavutil/mem.h"
 #include "avfilter.h"
 #include "formats.h"
 #include "internal.h"
 #include "video.h"
-#include "boxblur.h"
 
+
+enum EvalMode {
+    EVAL_MODE_INIT,
+    EVAL_MODE_FRAME,
+    EVAL_MODE_NB
+};
+
+enum var_name {
+    VAR_W,
+    VAR_H,
+    VAR_CW,
+    VAR_CH,
+    VAR_HSUB,
+    VAR_VSUB,
+    VAR_T,
+    VARS_NB
+};
+
+#define Y 0
+#define U 1
+#define V 2
+#define A 3
+
+typedef struct FilterParam {
+    int radius;
+    int power;
+    char *radius_expr;
+    AVExpr *radius_pexpr;
+} FilterParam;
 
 typedef struct BoxBlurContext {
     const AVClass *class;
@@ -45,11 +76,17 @@ typedef struct BoxBlurContext {
     int radius[4];
     int power[4];
     uint8_t *temp[2]; ///< temporary buffer used in blur_power()
+    int eval_mode;              ///< EvalMode
+    double var_values[VARS_NB];
 } BoxBlurContext;
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
     BoxBlurContext *s = ctx->priv;
+
+    av_expr_free(s->luma_param.radius_pexpr); s->luma_param.radius_pexpr = NULL;
+    av_expr_free(s->luma_param.radius_pexpr); s->chroma_param.radius_pexpr = NULL;
+    av_expr_free(s->luma_param.radius_pexpr); s->alpha_param.radius_expr = NULL;
 
     av_freep(&s->temp[0]);
     av_freep(&s->temp[1]);
@@ -72,26 +109,110 @@ static int query_formats(AVFilterContext *ctx)
     return ff_set_common_formats(ctx, formats);
 }
 
-static int config_input(AVFilterLink *inlink)
+static const char *const var_names[] = {
+    "w",
+    "h",
+    "cw",
+    "ch",
+    "hsub",
+    "vsub",
+    "t",
+    NULL
+};
+
+static int set_expr(FilterParam *param, const char *expr, const char *option, void *log_ctx)
 {
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
-    AVFilterContext    *ctx = inlink->dst;
-    BoxBlurContext *s = ctx->priv;
-    int w = inlink->w, h = inlink->h;
     int ret;
+    AVExpr *new_pexpr = NULL;
 
-    if (!(s->temp[0] = av_malloc(2*FFMAX(w, h))) ||
-        !(s->temp[1] = av_malloc(2*FFMAX(w, h))))
-        return AVERROR(ENOMEM);
+    if (!expr)
+        expr = param->radius_expr;
 
-    s->hsub = desc->log2_chroma_w;
-    s->vsub = desc->log2_chroma_h;
+    ret = av_expr_parse(&new_pexpr,
+                        expr,
+                        var_names,
+                        NULL, NULL, NULL, NULL, 0, log_ctx);
+    if (ret < 0) {
+        av_log(log_ctx, AV_LOG_ERROR,
+               "Error when evaluating the expression '%s' for %s\n",
+               expr, option);
+        return ret;
+    }
 
-    ret = ff_boxblur_eval_filter_params(inlink,
-                                        &s->luma_param,
-                                        &s->chroma_param,
-                                        &s->alpha_param);
+    if (param->radius_pexpr)
+        av_expr_free(param->radius_pexpr);
+    param->radius_pexpr = new_pexpr;
+    return 0;
+}
 
+static int eval_filter_params(AVFilterContext *ctx,
+                              FilterParam *luma_param,
+                              FilterParam *chroma_param,
+                              FilterParam *alpha_param)
+{
+    BoxBlurContext *s = ctx->priv;
+    int w = s->var_values[VAR_W], h = s->var_values[VAR_H],
+        cw = s->var_values[VAR_CW], ch = s->var_values[VAR_CW];
+
+    if (!luma_param->radius_pexpr) {
+        av_log(ctx, AV_LOG_ERROR, "Luma radius expression is not set.\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (!chroma_param->radius_pexpr) {
+        av_log(ctx, AV_LOG_ERROR, "Chroma radius expression is not set.\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (!alpha_param->radius_pexpr) {
+        av_log(ctx, AV_LOG_ERROR, "Alpha radius expression is not set.\n");
+        return AVERROR(EINVAL);
+    }
+
+    /* fill missing params */
+    if (chroma_param->power < 0)
+        chroma_param->power = luma_param->power;
+
+    if (alpha_param->power < 0)
+        alpha_param->power = luma_param->power;
+
+#define EVAL_RADIUS_EXPR(comp) \
+    comp->radius = av_expr_eval(comp->radius_pexpr, s->var_values, ctx);
+
+    EVAL_RADIUS_EXPR(luma_param)
+    EVAL_RADIUS_EXPR(chroma_param)
+    EVAL_RADIUS_EXPR(alpha_param)
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "luma_radius:%d luma_power:%d "
+           "chroma_radius:%d chroma_power:%d "
+           "alpha_radius:%d alpha_power:%d\n",
+           luma_param  ->radius, luma_param  ->power,
+           chroma_param->radius, chroma_param->power,
+           alpha_param ->radius, alpha_param ->power);
+
+#define CHECK_RADIUS_VAL(w_, h_, comp)                                        \
+    if (comp->radius < 0 ||                                                   \
+        2*comp->radius > FFMIN(w_, h_)) {                                     \
+        av_log(ctx, AV_LOG_ERROR,                                             \
+               "Invalid " #comp " radius value %d, must be >= 0 and <= %d\n", \
+               comp->radius, FFMIN(w_, h_)/2);                                \
+        return AVERROR(EINVAL);                                               \
+    }
+    CHECK_RADIUS_VAL(w,  h,  luma_param)
+    CHECK_RADIUS_VAL(cw, ch, chroma_param)
+    CHECK_RADIUS_VAL(w,  h,  alpha_param)
+
+    return 0;
+}
+
+static int eval_expr(AVFilterContext *ctx)
+{
+    BoxBlurContext *s = ctx->priv;
+    int ret = eval_filter_params(ctx,
+                                 &s->luma_param,
+                                 &s->chroma_param,
+                                 &s->alpha_param);
     if (ret != 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to evaluate "
                "filter params: %d.\n", ret);
@@ -105,6 +226,89 @@ static int config_input(AVFilterLink *inlink)
     s->power[Y] = s->luma_param.power;
     s->power[U] = s->power[V] = s->chroma_param.power;
     s->power[A] = s->alpha_param.power;
+
+    return 0;
+}
+
+static int parse_expr(AVFilterContext *ctx)
+{
+    BoxBlurContext *s = ctx->priv;
+    int ret;
+
+    ret = set_expr(&s->luma_param, NULL, "luma_radius", ctx);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Error when evaluating luma_param radius expression '%s'\n", s->luma_param.radius_expr);
+        return ret;
+    }
+
+    if (s->chroma_param.radius_expr)
+        ret = set_expr(&s->chroma_param, NULL, "chroma_radius", ctx);
+    else
+        ret = set_expr(&s->chroma_param, s->luma_param.radius_expr, "luma_radius", ctx);
+
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Error when evaluating chroma_radius radius expression '%s'\n", s->chroma_param.radius_expr);
+        return ret;
+    }
+
+    if (s->alpha_param.radius_expr)
+        ret = set_expr(&s->alpha_param, NULL, "alpha_radius", ctx);
+    else
+        ret = set_expr(&s->alpha_param, s->luma_param.radius_expr, "luma_radius", ctx);
+
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Error when evaluating alpha_radius radius expression '%s'\n", s->alpha_param.radius_expr);
+        return ret;
+    }
+    return ret;
+}
+
+static int config_input(AVFilterLink *inlink)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
+    AVFilterContext    *ctx = inlink->dst;
+    BoxBlurContext *s = ctx->priv;
+    int w = inlink->w, h = inlink->h, cw, ch;
+    int ret;
+
+    if (!(s->temp[0] = av_malloc(2*FFMAX(w, h))) ||
+        !(s->temp[1] = av_malloc(2*FFMAX(w, h))))
+        return AVERROR(ENOMEM);
+
+    s->hsub = desc->log2_chroma_w;
+    s->vsub = desc->log2_chroma_h;
+
+    ret = parse_expr(ctx);
+    if (ret < 0) {
+        return ret;
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "lr:%d cr:%d ar:%d\n",
+           s->luma_param.radius,
+           s->chroma_param.radius,
+           s->alpha_param.radius);
+
+    s->var_values[VAR_W]       = w;
+    s->var_values[VAR_H]       = h;
+    s->var_values[VAR_CW] = cw = w>>(desc->log2_chroma_w);
+    s->var_values[VAR_CH] = ch = h>>(desc->log2_chroma_h);
+    s->var_values[VAR_HSUB]    = 1<<(desc->log2_chroma_w);
+    s->var_values[VAR_VSUB]    = 1<<(desc->log2_chroma_h);
+    s->var_values[VAR_T]       = NAN;
+
+    if (s->eval_mode == EVAL_MODE_INIT) {
+        ret = eval_expr(ctx);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE,
+           "w:%d chroma_w:%d h:%d chroma_h:%d\n",
+           w, cw, h, ch);
 
     return 0;
 }
@@ -230,10 +434,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     BoxBlurContext *s = ctx->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     AVFrame *out;
-    int plane;
-    int cw = AV_CEIL_RSHIFT(inlink->w, s->hsub), ch = AV_CEIL_RSHIFT(in->height, s->vsub);
-    int w[4] = { inlink->w, cw, cw, inlink->w };
-    int h[4] = { in->height, ch, ch, in->height };
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     const int depth = desc->comp[0].depth;
     const int pixsize = (depth+7)/8;
@@ -245,17 +445,34 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
     av_frame_copy_props(out, in);
 
-    for (plane = 0; plane < 4 && in->data[plane] && in->linesize[plane]; plane++)
-        hblur(out->data[plane], out->linesize[plane],
-              in ->data[plane], in ->linesize[plane],
-              w[plane], h[plane], s->radius[plane], s->power[plane],
-              s->temp, pixsize);
+    s->var_values[VAR_T] = in->pts == AV_NOPTS_VALUE ?
+                           NAN : in->pts * av_q2d(inlink->time_base);
 
-    for (plane = 0; plane < 4 && in->data[plane] && in->linesize[plane]; plane++)
-        vblur(out->data[plane], out->linesize[plane],
-              out->data[plane], out->linesize[plane],
-              w[plane], h[plane], s->radius[plane], s->power[plane],
-              s->temp, pixsize);
+    if (s->eval_mode == EVAL_MODE_FRAME) {
+        int ret = eval_expr(ctx);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    {
+        int plane;
+        int cw = AV_CEIL_RSHIFT(inlink->w, s->hsub), ch = AV_CEIL_RSHIFT(in->height, s->vsub);
+        int w[4] = { inlink->w, cw, cw, inlink->w };
+        int h[4] = { in->height, ch, ch, in->height };
+
+        for (plane = 0; plane < 4 && in->data[plane] && in->linesize[plane]; plane++)
+            hblur(out->data[plane], out->linesize[plane],
+                  in ->data[plane], in ->linesize[plane],
+                  w[plane], h[plane], s->radius[plane], s->power[plane],
+                  s->temp, pixsize);
+
+        for (plane = 0; plane < 4 && in->data[plane] && in->linesize[plane]; plane++)
+            vblur(out->data[plane], out->linesize[plane],
+                  out->data[plane], out->linesize[plane],
+                  w[plane], h[plane], s->radius[plane], s->power[plane],
+                  s->temp, pixsize);
+    }
 
     av_frame_free(&in);
 
@@ -281,6 +498,9 @@ static const AVOption boxblur_options[] = {
     { "alpha_power",  "How many times should the boxblur be applied to alpha",  OFFSET(alpha_param.power), AV_OPT_TYPE_INT, {.i64=-1}, -1, INT_MAX, .flags = FLAGS },
     { "ap",           "How many times should the boxblur be applied to alpha",  OFFSET(alpha_param.power), AV_OPT_TYPE_INT, {.i64=-1}, -1, INT_MAX, .flags = FLAGS },
 
+    { "eval", "specify when to evaluate expressions", OFFSET(eval_mode), AV_OPT_TYPE_INT, {.i64 = EVAL_MODE_FRAME}, 0, EVAL_MODE_NB-1, FLAGS, "eval" },
+         { "init",  "eval expressions once during initialization", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_INIT},  .flags = FLAGS, .unit = "eval" },
+         { "frame", "eval expressions per-frame",                  0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_FRAME}, .flags = FLAGS, .unit = "eval" },
     { NULL }
 };
 
@@ -305,13 +525,13 @@ static const AVFilterPad avfilter_vf_boxblur_outputs[] = {
 };
 
 AVFilter ff_vf_boxblur = {
-    .name          = "boxblur",
-    .description   = NULL_IF_CONFIG_SMALL("Blur the input."),
-    .priv_size     = sizeof(BoxBlurContext),
-    .priv_class    = &boxblur_class,
-    .uninit        = uninit,
-    .query_formats = query_formats,
-    .inputs        = avfilter_vf_boxblur_inputs,
-    .outputs       = avfilter_vf_boxblur_outputs,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    .name            = "boxblur",
+    .description     = NULL_IF_CONFIG_SMALL("Blur the input."),
+    .priv_size       = sizeof(BoxBlurContext),
+    .priv_class      = &boxblur_class,
+    .uninit          = uninit,
+    .query_formats   = query_formats,
+    .inputs          = avfilter_vf_boxblur_inputs,
+    .outputs         = avfilter_vf_boxblur_outputs,
+    .flags           = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
 };
